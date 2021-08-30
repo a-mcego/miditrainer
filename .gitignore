@@ -127,3 +127,9 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+datasets/
+outs/
+validation_midis/
+*.npy
+*_log.txt
