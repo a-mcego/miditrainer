@@ -11,19 +11,19 @@ import glob
 
 import midisave
 
-#midis = glob.glob(f"Q:\\midi\\*\\*.mid")
-#savefilename = "training_tokens.npy"
-#clip = False
+midis = glob.glob(f"Q:\\midi\\*\\*.mid")
+savefilename = f"C:\\datasets\\midi\\training_tokens_{midisave.version}.npy"
+clip = False
 
-#midis = glob.glob("C:\\Users\\liimaeve\\Dropbox\\koodaus2\\GitHub\\miditrainer\\validation_midis\\*.mid")
-#savefilename = "validation_tokens_v2.npy"
+#midis = glob.glob("C:\\datasets\\midi\\validation_midis\\*.mid")
+#savefilename = f"C:\\datasets\\midi\\validation_tokens_{midisave.version}.npy"
 #clip = True
 
-midis = list(pathlib.Path('q:\\gamemidi').rglob('*.mid'))
-print(f"{len(midis)} midis found.")
-savefilename = "gamemidi_tokens_test.npy"
-clip = True
+#midis = list(pathlib.Path('q:\\gamemidi').rglob('*.mid'))
+#savefilename = f"C:\\datasets\\midi\\gamemidi_tokens_{midisave.version}.npy"
+#clip = True
 
+print(f"{len(midis)} midis found.")
 #print(midis)
 
 n_good = 0

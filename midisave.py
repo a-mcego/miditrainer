@@ -2,6 +2,10 @@ import mido
 from mido.midifiles.midifiles import DEFAULT_TEMPO
 from mido.midifiles.tracks import MidiTrack, merge_tracks, fix_end_of_track
 
+version = "v4"
+
+DELAY_PRECISION=0.001 #how many seconds the delay of 1 has
+
 def convert_delay(x):
     if x > 3008:
         x = 3008
@@ -44,16 +48,23 @@ def unconvert_delay(x):
         ret=(x-368)*64+2048
     return ret
 
-TOKEN_CHANNEL          = 0
-TOKEN_DELAY            = 16
-TOKEN_NOTE_ON          = 16+384
-TOKEN_NOTE_OFF         = 16+384+128
-TOKEN_VELOCITY         = 16+384+128+128
-TOKEN_CONTROLLER_TYPE  = 16+384+128+128+128
-TOKEN_CONTROLLER_VALUE = 16+384+128+128+128+128
-TOKEN_PITCHBEND        = 16+384+128+128+128+128+128
-TOKEN_PROGRAM          = 16+384+128+128+128+128+128+128
-N_TOKEN_TOTAL          = 16+384+128+128+128+128+128+128+128
+#these are the controller #s supported by General MIDI
+id_to_controller = [1, 7, 10, 11, 64, 100, 101, 121, 123]
+N_CONTROLLERS = len(id_to_controller)
+controller_to_id = {}
+for c in range(N_CONTROLLERS):
+    controller_to_id[id_to_controller[c]] = c
+
+TOKEN_CHANNEL_PROGRAM  = 0
+TOKEN_DELAY            = 16*128
+TOKEN_NOTE_ON          = 16*128+384
+TOKEN_NOTE_ON_DRUMS    = 16*128+384+128
+TOKEN_NOTE_OFF         = 16*128+384+128+128
+TOKEN_VELOCITY         = 16*128+384+128+128+128
+TOKEN_CONTROLLER_TYPE  = 16*128+384+128+128+128+128
+TOKEN_CONTROLLER_VALUE = 16*128+384+128+128+128+128+N_CONTROLLERS
+TOKEN_PITCHBEND        = 16*128+384+128+128+128+128+N_CONTROLLERS+128
+N_TOKEN_TOTAL          = 16*128+384+128+128+128+128+N_CONTROLLERS+128+128
 
 def load_midi(filename, clip):
     try:
@@ -63,6 +74,8 @@ def load_midi(filename, clip):
         return None
         
     total_delay=0.0
+    
+    current_program = [0]*16
     
     #print(f"Good file {filename}")
     
@@ -84,35 +97,43 @@ def load_midi(filename, clip):
             if m['type'] in ['text','time_signature','track_name','midi_port','key_signature','copyright','instrument_name','channel_prefix','end_of_track', 'marker', 'sysex', 'smpte_offset', 'lyrics', 'cue_marker', 'sequencer_specific', 'aftertouch', 'polytouch', 'sequence_number', 'set_tempo', 'stop']:
                 continue
             
-            stime = convert_delay(round(total_delay*1000))
+            if m['type'] == 'control_change' and m['control'] not in id_to_controller:
+                continue
+            
+            stime = convert_delay(round(total_delay*(1.0/DELAY_PRECISION)))
             if stime != 0 and m['time'] != 0:
                 out.extend([TOKEN_DELAY+stime])
-                total_delay = max(0.0,total_delay-unconvert_delay(stime)*0.001)
+                total_delay = max(0.0,total_delay-unconvert_delay(stime)*DELAY_PRECISION)
             
             if m['type'] == 'note_on' or m['type'] == 'note_off':
                 if current_channel != m['channel']:
                     current_channel = m['channel']
-                    out.extend([TOKEN_CHANNEL+m['channel']])
+                    out.extend([TOKEN_CHANNEL_PROGRAM+m['channel']+current_program[m['channel']]*16])
                 
                 if m['velocity'] == 0 or m['type'] == 'note_off':
-                    out.extend([TOKEN_NOTE_OFF+m['note']])
+                    if current_channel != 9:
+                        out.extend([TOKEN_NOTE_OFF+m['note']])
                 else:
-                    out.extend([TOKEN_NOTE_ON+m['note'], TOKEN_VELOCITY+m['velocity']])
+                    if current_channel == 9:
+                        out.extend([TOKEN_NOTE_ON_DRUMS+m['note'], TOKEN_VELOCITY+m['velocity']])
+                    else:
+                        out.extend([TOKEN_NOTE_ON+m['note'], TOKEN_VELOCITY+m['velocity']])
             
             elif m['type'] == 'control_change':
-                current_channel = m['channel']
-                out.extend([TOKEN_CHANNEL+m['channel']])
-                out.extend([TOKEN_CONTROLLER_TYPE+m['control'], TOKEN_CONTROLLER_VALUE+m['value']])
+                if m['control'] in id_to_controller:
+                    current_channel = m['channel']
+                    out.extend([TOKEN_CHANNEL_PROGRAM+m['channel']+current_program[m['channel']]*16])
+                    out.extend([TOKEN_CONTROLLER_TYPE+controller_to_id[m['control']], TOKEN_CONTROLLER_VALUE+m['value']])
             elif m['type'] == 'pitchwheel':
                 if current_channel != m['channel']:
                     current_channel = m['channel']
-                    out.extend([TOKEN_CHANNEL+m['channel']])
+                    out.extend([TOKEN_CHANNEL_PROGRAM+m['channel']+current_program[m['channel']]*16])
 
                 out.extend([TOKEN_PITCHBEND+(m['pitch']+8192)//128])
             elif m['type'] == 'program_change':
                 current_channel = m['channel']
-                out.extend([TOKEN_CHANNEL+m['channel']])
-                out.extend([TOKEN_PROGRAM+m['program']])
+                current_program[current_channel] = m['program']
+                out.extend([TOKEN_CHANNEL_PROGRAM+m['channel']+m['program']*16])
 
     except Exception as err:
         #print(f"MERGE {filename}: {type(err)} {err}")
@@ -128,8 +149,9 @@ def save_midi(data, filename):
 
     current_channel = 0
     current_delay = 0.0
-    current_controller = 0
+    current_controller = None
     current_noteon = -1
+    current_program = [0]*16
 
     tempo = DEFAULT_TEMPO
     clocks_per_click = mid.ticks_per_beat
@@ -146,12 +168,11 @@ def save_midi(data, filename):
         
     
     for d in data:
-        if d>=TOKEN_PROGRAM:
-            track.append(mido.Message('program_change', channel=current_channel, program=d-TOKEN_PROGRAM, time=get_delay()))
-        elif d>=TOKEN_PITCHBEND:
+        if d>=TOKEN_PITCHBEND:
             track.append(mido.Message('pitchwheel', channel=current_channel, pitch=(d-TOKEN_PITCHBEND)*128-8192, time=get_delay()))
         elif d>=TOKEN_CONTROLLER_VALUE:
-            track.append(mido.Message('control_change', channel=current_channel, control=current_controller, value=d-TOKEN_CONTROLLER_VALUE, time=get_delay()))
+            if current_controller is not None:
+                track.append(mido.Message('control_change', channel=current_channel, control=id_to_controller[current_controller], value=d-TOKEN_CONTROLLER_VALUE, time=get_delay()))
         elif d>=TOKEN_CONTROLLER_TYPE:
             current_controller = d-TOKEN_CONTROLLER_TYPE
         elif d>=TOKEN_VELOCITY:
@@ -160,13 +181,19 @@ def save_midi(data, filename):
                 current_noteon = -1
         elif d>=TOKEN_NOTE_OFF:
             track.append(mido.Message('note_off', channel=current_channel, time=get_delay(), note=d-TOKEN_NOTE_OFF, velocity=0))
+        elif d>=TOKEN_NOTE_ON_DRUMS:
+            current_noteon = d-TOKEN_NOTE_ON_DRUMS
         elif d>=TOKEN_NOTE_ON:
             current_noteon = d-TOKEN_NOTE_ON
         elif d>=TOKEN_DELAY:
-            current_delay += unconvert_delay(d-TOKEN_DELAY)*0.001
-            total_length += unconvert_delay(d-TOKEN_DELAY)*0.001
-        elif d>=TOKEN_CHANNEL:
-            current_channel = d-TOKEN_CHANNEL
+            current_delay += unconvert_delay(d-TOKEN_DELAY)*DELAY_PRECISION
+            total_length += unconvert_delay(d-TOKEN_DELAY)*DELAY_PRECISION
+        elif d>=TOKEN_CHANNEL_PROGRAM:
+            data = d-TOKEN_CHANNEL_PROGRAM
+            current_channel = data%16
+            if current_program[current_channel] != data//16:
+                track.append(mido.Message('program_change', channel=current_channel, program=data//16, time=get_delay()))
+                current_program[current_channel] = data//16
 
     print(len(track), total_length, end=" ")
     mid.save(filename)
