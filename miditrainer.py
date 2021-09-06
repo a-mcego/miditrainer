@@ -129,23 +129,32 @@ def jsonsave(obj, filename):
 set_gpu_settings()
 
 prm = {} #parameters
-prm['PRINT_STEPS'] = 64
-prm['VALIDATION_STEPS'] = prm['PRINT_STEPS']*8
-prm['GEN_STEPS'] = prm['PRINT_STEPS']*16000000
-prm['SAVE_STEPS'] = prm['PRINT_STEPS']*32#000000
+
+generate = False
+if generate:
+    prm['PRINT_STEPS'] = 1
+    prm['VALIDATION_STEPS'] = prm['PRINT_STEPS']*80000000
+    prm['GEN_STEPS'] = prm['PRINT_STEPS']
+    prm['SAVE_STEPS'] = prm['PRINT_STEPS']*3200000
+else:
+    prm['PRINT_STEPS'] = 64
+    prm['VALIDATION_STEPS'] = prm['PRINT_STEPS']*8#0000000
+    prm['GEN_STEPS'] = prm['PRINT_STEPS']*16000000
+    prm['SAVE_STEPS'] = prm['PRINT_STEPS']*32#00000
 prm['MODEL_SIZE'] = 768
-prm['XF_LAYERS'] = 12
-prm['XF_HEADS'] = 6
+prm['XF_LAYERS'] = 6
+prm['XF_HEADS'] = 12
 prm['LEARNING_RATE'] = 0.001
 prm['LEARNING_RATE_MIN'] = 0.001
-prm['ADAM_EPSILON'] = 1e-4
+prm['ADAM_EPSILON'] = 1e-5
 prm['BATCH_SIZE'] = 16
 prm['WARMUP_STEPS'] = 0
 prm['N_TIMESTEPS'] = 512
 prm['VOCAB_SIZE'] = midisave.N_TOKEN_TOTAL
-prm['GEN_LENGTH'] = prm['N_TIMESTEPS']*3
-prm['TOP_K'] = 10
+prm['GEN_LENGTH'] = prm['N_TIMESTEPS']*8
+prm['TOP_P'] = 0.94
 prm['MODEL_SAVE_DIR'] = "Q:\\midi_model_saves\\" + sys.argv[1]
+prm['TOKEN_SHIFT'] = 4
 
 for key in prm:
     print(f"{key}={prm[key]} ",end="")
@@ -179,24 +188,39 @@ data = datahandler.NumpyFileShuffle(prm['N_TIMESTEPS'], filename_t=f"C:\\dataset
 #print(list(zip(unique,counts)))
 #exit(0)
 
-
 class TaskSolver(tf.keras.Model):
     def __init__(self):
         super(TaskSolver,self).__init__()
 
         self.embedding = tf.keras.layers.Embedding(prm['VOCAB_SIZE'], prm['MODEL_SIZE'])
-        self.posenc = tf.convert_to_tensor(posenc.get_standard_posenc(prm['N_TIMESTEPS'], prm['MODEL_SIZE']))*0.05
 
-        self.xformer = Transformer(model_size=prm['MODEL_SIZE'], num_layers=prm['XF_LAYERS'], heads=prm['XF_HEADS'], use_causal_mask=True, use_counter=False, normalize_columns=False)
+        self.xformer = Transformer(model_size=prm['MODEL_SIZE'], num_layers=prm['XF_LAYERS'], heads=prm['XF_HEADS'], use_causal_mask=True, use_counter=False, normalize_columns=False, token_shift_n=prm['TOKEN_SHIFT'])
         
         self.logit_outputs = tf.keras.layers.Dense(prm['VOCAB_SIZE'])
         
     def call(self, n_input):
         n_output = n_input
-        n_output = self.embedding(n_output) + self.posenc[:n_input.shape[-1]]
+        n_output = self.embedding(n_output)
+        
+        #this was moved to transformer
+        #if prm['TOKEN_SHIFT'] is not None:
+        #    n_output = token_shift(n_output, prm['TOKEN_SHIFT'])
+        
         n_output = self.xformer(n_output)
         n_output = self.logit_outputs(n_output)
         return n_output
+
+    def call_gen(self, n_input, transformer_cache=None, tokenshift_cache=None):
+        n_output = n_input
+        n_output = self.embedding(n_output)
+        
+        #this was moved to transformer
+        #if prm['TOKEN_SHIFT'] is not None:
+        #    n_output = token_shift(n_output, prm['TOKEN_SHIFT'])
+        
+        n_output, new_cache, _, new_tokenshift_cache = self.xformer.call_gen(n_output, cache_tgt=transformer_cache, cache_token_shift=tokenshift_cache)
+        n_output = self.logit_outputs(n_output)
+        return n_output, new_cache, new_tokenshift_cache
         
 tasksolver = TaskSolver()
 
@@ -365,18 +389,56 @@ while True:
             current_note = [-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1]
             
             #this one loads a midi 
-            generated = midisave.load_midi("C:\\datasets\\midi\\validation_midis\\spora.mid", clip=True)
+            #generated = midisave.load_midi("C:\\datasets\\midi\\validation_midis\\spora.mid", clip=True)
+            #generated = midisave.load_midi("C:\\datasets\\midi\\omat\\dehuman.mid", clip=True)
+            #generated = midisave.load_midi("C:\\datasets\\midi\\validation_midis\\main.mid", clip=True)
+            generated = midisave.load_midi("Q:\\gamemidi\\Doom\\02 - At Doom's Gate (E1M1).mid", clip=True)
             generated = generated[:256]
+            
+            #TESTING START
+            """n_output_old = tasksolver(tf.expand_dims(generated,axis=0)[0:1,-prm['N_TIMESTEPS']:])
+            tf_ch = None
+            tokenshift_ch = None
+            nns = []
+            for i in range(0,16):
+                gen = generated[i:i+1]
+                nn, tf_ch, tokenshift_ch = tasksolver.call_gen(tf.expand_dims(gen,axis=0), tf_ch, tokenshift_ch)
+                nns.append(nn)
+            n_output_new = tf.concat(nns, axis=-2)
+            print(tf.reduce_mean(tf.square(n_output_new-n_output_old),axis=-1))
+            #TESTING END
+            exit(0)"""
+            
+            #generate the cache for the prompt
+            if len(generated) > 1:
+                _, transformer_cache, tokenshift_cache = tasksolver.call_gen(tf.expand_dims(generated,axis=0)[0:1,:-1])
+            else:
+                transformer_cache = None
+                tokenshift_cache = None
             
             #this one starts from scratch with no prompt
             #generated = [midisave.TOKEN_DELAY+16] #start the generated stuff with a short pause
             while len(generated) <= prm['GEN_LENGTH']:
-                n_output = tasksolver(tf.expand_dims(generated,axis=0)[0:1,-prm['N_TIMESTEPS']:])
-                result = tf.math.top_k(n_output[0,-1], k=prm['TOP_K'], sorted=False)
-                rv = result.values
-                rv = tf.nn.softmax(result.values).numpy()
-                ri = result.indices.numpy()
-                choice = int(np.random.choice(ri, p=rv))
+                n_output,transformer_cache,tokenshift_cache = tasksolver.call_gen(tf.expand_dims(generated,axis=0)[0:1,-1:], transformer_cache, tokenshift_cache)
+                
+                #top-k sampling
+                #result = tf.math.top_k(n_output[0,-1], k=prm['TOP_K'], sorted=False)
+                #rv = result.values
+                #rv = tf.nn.softmax(result.values).numpy()
+                #ri = result.indices.numpy()
+                #choice = int(np.random.choice(ri, p=rv))
+                
+                #top-p sampling
+                result = tf.nn.softmax(n_output[0,-1]).numpy()
+                sort_order = np.argsort(result)[::-1]
+                result = np.sort(result)[::-1]
+                max_index = np.sum(np.less(np.cumsum(result), prm['TOP_P']).astype(np.int64))
+                max_index = np.maximum(1, max_index)
+                sort_order = sort_order[:max_index]
+                result = result[:max_index]
+                result /= np.sum(result)
+                choice = int(np.random.choice(sort_order, p=result))
+                
                 generated.append(choice)
             
                 if midisave.TOKEN_CHANNEL_PROGRAM <= choice < midisave.TOKEN_CHANNEL_PROGRAM+16*128:
@@ -384,15 +446,12 @@ while True:
                     current_instrument[current_channel] = (choice-midisave.TOKEN_CHANNEL_PROGRAM)//16
                 
                 elif midisave.TOKEN_NOTE_ON <= choice < midisave.TOKEN_NOTE_ON+128:
-                    #print(f"{len(generated)} NOTE ON c{current_channel} n{choice-midisave.TOKEN_NOTE_ON}")
                     current_note[current_channel] = choice-midisave.TOKEN_NOTE_ON
                 elif midisave.TOKEN_VELOCITY <= choice < midisave.TOKEN_VELOCITY+128:
                     if current_note[current_channel] != -1:
                         notes_on[current_channel].append((current_note[current_channel],len(generated)))
-                        #print(f"{len(generated)} VELOCITY c{current_channel} n{current_note[current_channel]} {notes_on[current_channel]}")
                         current_note[current_channel] = -1
                 elif midisave.TOKEN_NOTE_OFF <= choice < midisave.TOKEN_NOTE_OFF+128:
-                    #print(f"{len(generated)} NOTE OFF c{current_channel} n{choice-midisave.TOKEN_NOTE_OFF}")
                     notes_on[current_channel] = [x for x in notes_on[current_channel] if x[0] != choice-midisave.TOKEN_NOTE_OFF]
                     
                 for c in range(16):
@@ -408,10 +467,13 @@ while True:
                         #print(f"{len(generated)} BAD NOTE c{c} n{bad_note[0]} t{bad_note[1]}")
                         if current_channel != c:
                             generated.append(midisave.TOKEN_CHANNEL_PROGRAM+c+current_instrument[c]*16)
+                            n_output,transformer_cache,tokenshift_cache = tasksolver.call_gen(tf.expand_dims(generated,axis=0)[0:1,-1:], transformer_cache, tokenshift_cache)
                             current_channel = c
+                            
                         generated.append(midisave.TOKEN_NOTE_OFF+bad_note[0])
+                        n_output,transformer_cache,tokenshift_cache = tasksolver.call_gen(tf.expand_dims(generated,axis=0)[0:1,-1:], transformer_cache, tokenshift_cache)
             
-            midisave.save_midi(generated, f"outs/{training_sess_id}_{steps}.mid")
+            midisave.save_midi(generated, f"outs/{training_sess_id}_{steps}s.mid")
 
 
         if steps % prm['SAVE_STEPS'] == 0:
