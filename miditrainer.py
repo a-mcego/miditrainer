@@ -6,9 +6,20 @@ import sys
 import json
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2' 
+
 import numpy as np
 np.set_printoptions(precision=4,suppress=True)
 import tensorflow as tf
+    
+def set_gpu_settings():
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+      for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+
+set_gpu_settings()
+
+import functools
 import time
 import enum
 import matplotlib.pyplot as plt
@@ -16,7 +27,7 @@ import datahandler
 import midisave
 
 from counting import Counting
-from transformer import Transformer
+from transformer import Transformer, TransformerFFNFirst
 import posenc
 
 def get_replacer(tokens):
@@ -112,13 +123,6 @@ if len(sys.argv) != 2:
     exit(0)
 if not os.path.exists("outs"):
     os.mkdir("outs")
-    
-def set_gpu_settings():
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    if gpus:
-      for gpu in gpus:
-        tf.config.experimental.set_memory_growth(gpu, True)
-
 
 def jsonload(filename):
     return json.load(open(filename,"r"))
@@ -126,8 +130,6 @@ def jsonload(filename):
 def jsonsave(obj, filename):
     json.dump(obj, open(filename, "w"))
     
-set_gpu_settings()
-
 prm = {} #parameters
 
 generate = False
@@ -151,10 +153,13 @@ prm['BATCH_SIZE'] = 16
 prm['WARMUP_STEPS'] = 0
 prm['N_TIMESTEPS'] = 512
 prm['VOCAB_SIZE'] = midisave.N_TOKEN_TOTAL
-prm['GEN_LENGTH'] = prm['N_TIMESTEPS']*8
-prm['TOP_P'] = 0.94
+prm['GEN_LENGTH'] = 4096
+prm['TOP_P'] = 0.9
 prm['MODEL_SAVE_DIR'] = "Q:\\midi_model_saves\\" + sys.argv[1]
 prm['TOKEN_SHIFT'] = 4
+prm['AUX_LOSSES'] = False
+prm['EVALUATION_ITERS'] = 6
+prm['EMBEDDING_SLICER'] = 1
 
 for key in prm:
     print(f"{key}={prm[key]} ",end="")
@@ -188,41 +193,99 @@ data = datahandler.NumpyFileShuffle(prm['N_TIMESTEPS'], filename_t=f"C:\\dataset
 #print(list(zip(unique,counts)))
 #exit(0)
 
+def distance_from_uniform(x):
+    N = x.shape[-1]
+    return tf.reduce_sum(tf.math.xlogy(x, x), axis=-1) + tf.math.log(N) * tf.reduce_sum(x, axis=-1)
+
+class TaskSolverRecursive(tf.keras.Model):
+    def __init__(self):
+        super(TaskSolverRecursive,self).__init__()
+        
+        self.embedding_slicer = prm['EMBEDDING_SLICER']
+
+        self.embedding = tf.keras.layers.Embedding(prm['VOCAB_SIZE'], prm['MODEL_SIZE']//self.embedding_slicer)
+
+        self.xformer = Transformer(model_size=prm['MODEL_SIZE'], num_layers=1, heads=prm['XF_HEADS'], use_causal_mask=True, use_counter=False, normalize_columns=False, aux_losses=True, token_shift_n=prm['TOKEN_SHIFT'])
+        #self.xformer = TransformerFFNFirst(model_size=prm['MODEL_SIZE'], num_layers=1, heads=prm['XF_HEADS'], use_causal_mask=True, use_counter=False, normalize_columns=False, aux_losses=True, token_shift_n=prm['TOKEN_SHIFT'])
+        
+        
+        
+        normalizer = functools.partial(tf.keras.layers.LayerNormalization, center=False, scale=True)
+        self.output_norm = normalizer()
+        self.logit_outputs = tf.keras.layers.Dense(prm['VOCAB_SIZE'])
+        
+    def call(self, n_input, n_iters=prm['XF_LAYERS']):
+        n_output = n_input
+        n_output = self.embedding(n_output)
+        
+        if self.embedding_slicer > 1:
+            n_output = tf.reshape(tf.repeat(tf.expand_dims(n_output,axis=-1), self.embedding_slicer, axis=-1),[n_output.shape[0],n_output.shape[1],-1])
+        
+        outputs = []
+        for n in range(n_iters):
+            n_output = self.xformer(n_output)[-1]
+        logits = n_output
+        logits = self.output_norm(logits)
+        logits = self.logit_outputs(logits)
+        return logits
+
+
+    def call_gen(self, n_input, transformer_cache=None, tokenshift_cache=None):
+        n_output = n_input
+        n_output = self.embedding(n_output)
+        
+        if self.embedding_slicer > 1:
+            n_output = tf.reshape(tf.repeat(tf.expand_dims(n_output,axis=-1), self.embedding_slicer, axis=-1),[n_output.shape[0],n_output.shape[1],-1])
+
+        outputs = []
+        new_tf_caches = []
+        new_tokenshift_caches = []
+        for n in range(n_iters):
+            n_output = self.xformer
+            n_output, new_cache, _, new_tokenshift_cache = self.xformer.call_gen(n_output, cache_tgt=transformer_cache, cache_token_shift=tokenshift_cache)
+            new_tf_caches.append(new_tf_cache)
+            new_tokenshift_caches.append(new_tokenshift_cache)
+        n_output = self.logit_outputs(n_output)
+        return n_output, new_tf_caches, new_tokenshift_caches
+
 class TaskSolver(tf.keras.Model):
     def __init__(self):
         super(TaskSolver,self).__init__()
 
         self.embedding = tf.keras.layers.Embedding(prm['VOCAB_SIZE'], prm['MODEL_SIZE'])
 
-        self.xformer = Transformer(model_size=prm['MODEL_SIZE'], num_layers=prm['XF_LAYERS'], heads=prm['XF_HEADS'], use_causal_mask=True, use_counter=False, normalize_columns=False, token_shift_n=prm['TOKEN_SHIFT'])
+        self.xformer = Transformer(model_size=prm['MODEL_SIZE'], num_layers=prm['XF_LAYERS'], heads=prm['XF_HEADS'], use_causal_mask=True, use_counter=False, normalize_columns=False, aux_losses=True, token_shift_n=prm['TOKEN_SHIFT'])
         
-        self.logit_outputs = tf.keras.layers.Dense(prm['VOCAB_SIZE'])
+        normalizer = functools.partial(tf.keras.layers.LayerNormalization, center=False, scale=True)
+        self.output_norm = [normalizer() for _ in range(prm['XF_LAYERS'])]
+        self.logit_outputs = [tf.keras.layers.Dense(prm['VOCAB_SIZE']) for _ in range(prm['XF_LAYERS'])]
+        
         
     def call(self, n_input):
         n_output = n_input
         n_output = self.embedding(n_output)
         
-        #this was moved to transformer
-        #if prm['TOKEN_SHIFT'] is not None:
-        #    n_output = token_shift(n_output, prm['TOKEN_SHIFT'])
-        
         n_output = self.xformer(n_output)
-        n_output = self.logit_outputs(n_output)
-        return n_output
+        
+        outputs = []
+        for n in range(prm['XF_LAYERS']):
+            logits = n_output[n]
+            if (not prm['AUX_LOSSES']) and n < prm['XF_LAYERS']-1:
+                logits = tf.stop_gradient(logits)
+            logits = self.logit_outputs[n](self.output_norm[n](logits))
+            outputs.append(logits)
+            
+        return outputs
 
     def call_gen(self, n_input, transformer_cache=None, tokenshift_cache=None):
         n_output = n_input
         n_output = self.embedding(n_output)
         
-        #this was moved to transformer
-        #if prm['TOKEN_SHIFT'] is not None:
-        #    n_output = token_shift(n_output, prm['TOKEN_SHIFT'])
-        
         n_output, new_cache, _, new_tokenshift_cache = self.xformer.call_gen(n_output, cache_tgt=transformer_cache, cache_token_shift=tokenshift_cache)
         n_output = self.logit_outputs(n_output)
         return n_output, new_cache, new_tokenshift_cache
         
-tasksolver = TaskSolver()
+tasksolver = TaskSolverRecursive()
 
 def lr_scheduler():
     global steps
@@ -241,31 +304,27 @@ optimizer = tf.keras.optimizers.Adam(learning_rate=lr_scheduler,amsgrad=True,eps
 start_time = time.time()
 
 @tf.function
-def do_step(n_input, target, training):
+def do_step(n_input, target, training, n_iters=prm['XF_LAYERS']):
     losses = []
     accuracies_c = []
-    
     if training:
-        onehot = tf.one_hot(target, prm['VOCAB_SIZE'], dtype=tf.float32)
         with tf.GradientTape() as tape:
             n_output = tasksolver(n_input)
-            loss_c = tf.reduce_mean(
-              tf.keras.losses.categorical_crossentropy(
-              onehot, n_output, from_logits=True))
+            loss_c = tf.keras.losses.sparse_categorical_crossentropy(target, n_output, from_logits=True)
+            loss_c = tf.reduce_mean(loss_c, axis=[-1,-2])
             pred_ids = tf.keras.backend.argmax(n_output,axis=-1)
             losses.append(loss_c)
         gradients = tape.gradient(losses, tasksolver.trainable_variables, unconnected_gradients=tf.UnconnectedGradients.ZERO)
         optimizer.apply_gradients(zip(gradients, tasksolver.trainable_variables))
     else:
-        n_output = tasksolver(n_input)
-        loss_c = tf.reduce_mean(
-          tf.keras.losses.sparse_categorical_crossentropy(
-          target, n_output, from_logits=True))
+        n_output = tasksolver(n_input, n_iters=n_iters)
+        loss_c = tf.keras.losses.sparse_categorical_crossentropy(target, n_output, from_logits=True)
+        loss_c = tf.reduce_mean(loss_c, axis=[-1,-2])
         pred_ids = tf.keras.backend.argmax(n_output,axis=-1)
         losses.append(loss_c)
 
     correct_chars = tf.reduce_mean(tf.cast(tf.equal(pred_ids,target),dtype=tf.float32),axis=-1)
-    accuracy_c = tf.squeeze(tf.reduce_mean(correct_chars))
+    accuracy_c = tf.squeeze(tf.reduce_mean(correct_chars, axis=-1))
     accuracies_c.append(accuracy_c)
 
     return losses, accuracies_c, pred_ids
@@ -295,16 +354,16 @@ if os.path.isfile(prm['MODEL_SAVE_DIR']+'/settings.txt'):
 with open("training_log.txt", "a", encoding='utf8') as myfile:
     write_header(myfile)
 
+param_shown = False
 while True:
     input_data = []
     targets = []
     for _ in range(prm['BATCH_SIZE']):
         n_input, target = data.get_random_t_data(prm['N_TIMESTEPS'])
-        
-        n_input, target = augment_channels(n_input, target)
-        n_input, target = augment_notes(n_input, target)
-        n_input, target = augment_velocities(n_input, target)
-        n_input, target = augment_cvs(n_input, target)
+        #n_input, target = augment_channels(n_input, target)
+        #n_input, target = augment_notes(n_input, target)
+        #n_input, target = augment_velocities(n_input, target)
+        #n_input, target = augment_cvs(n_input, target)
         
         input_data.append(n_input)
         targets.append(target)
@@ -316,11 +375,32 @@ while True:
     targets = tf.cast(targets, tf.int64)
     
     losses, accuracies_char, _ = do_step(input_data, target=targets, training=True)
-    
     all_losses.extend(losses)
     all_accs_char.extend(accuracies_char)
+    
+    if not param_shown:
+        param_shown = True
+        print(f"#params = {tf.reduce_sum([tf.size(tens) for tens in tasksolver.trainable_variables])}")
 
     if steps % prm['PRINT_STEPS'] == 0:
+        with open("soft_attention.txt", "a", encoding='utf8') as myfile:
+            myfile.write(str(steps)+ " ")
+            for ta in tasksolver.xformer.tgt_alpha:
+                myfile.write(str(ta.numpy()).replace('[','').replace(']',''))
+            myfile.write(" | ")
+            for ta in tasksolver.xformer.tgt_beta:
+                myfile.write(str(ta.numpy()).replace('[','').replace(']',''))
+            myfile.write(" | ")
+            for ta in tasksolver.xformer.ffn_alpha:
+                myfile.write(str(ta.numpy()).replace('[','').replace(']',''))
+            myfile.write(" | ")
+            for ta in tasksolver.xformer.ffn_beta:
+                myfile.write(str(ta.numpy()).replace('[','').replace(']',''))
+            myfile.write(" | ")
+            myfile.write("\n")
+
+
+
         totaltime = time.time()-start_time
         time_per_token = totaltime / float(prm['N_TIMESTEPS']) / float(prm['BATCH_SIZE']) / float(prm['PRINT_STEPS'])
         
@@ -351,34 +431,43 @@ while True:
         if steps % prm['VALIDATION_STEPS'] == 0:
             vdata = data.get_v_data()
             
-            vdata_input = vdata[:-1]
-            vdata_target = vdata[1:]
+            print(f"vl/a ", end="")
             
-            vdata_input = vdata_input[:vdata_input.shape[0]-vdata_input.shape[0]%prm['N_TIMESTEPS']]
-            vdata_input = np.reshape(vdata_input, [-1, prm['N_TIMESTEPS']])
-            vdata_input = tf.cast(vdata_input, tf.int64)
+            testlengths = [prm['N_TIMESTEPS'], prm['N_TIMESTEPS']*2, prm['N_TIMESTEPS']*4]
+            for testlength in testlengths:
+            
+                vdata_input = vdata[:-1]
+                vdata_target = vdata[1:]
+                
+                vdata_input = vdata_input[:vdata_input.shape[0]-vdata_input.shape[0]%testlengths[-1]]
+                vdata_input = np.reshape(vdata_input, [-1, testlength])
+                vdata_input = tf.cast(vdata_input, tf.int64)
 
-            vdata_target = vdata_target[:vdata_target.shape[0]-vdata_target.shape[0]%prm['N_TIMESTEPS']]
-            vdata_target = np.reshape(vdata_target, [-1, prm['N_TIMESTEPS']])
-            vdata_target = tf.cast(vdata_target, tf.int64)
-            
-            v_result = np.zeros(shape=(2,vdata_input.shape[0]), dtype=np.float32)
-            
-            for start in range(0,vdata_input.shape[0]):
-                losses, accuracies, _ = do_step(vdata_input[start:start+1], target=vdata_target[start:start+1], training=False)
-                v_result[0,start] = losses[0].numpy()
-                v_result[1,start] = accuracies[0].numpy()
+                vdata_target = vdata_target[:vdata_target.shape[0]-vdata_target.shape[0]%testlengths[-1]]
+                vdata_target = np.reshape(vdata_target, [-1, testlength])
+                vdata_target = tf.cast(vdata_target, tf.int64)
                 
-            v_result = np.mean(v_result, axis=-1)
+                #v_result = np.zeros(shape=(2,vdata_input.shape[0],prm['EVALUATION_ITERS']), dtype=np.float32)
+                v_result = np.zeros(shape=(2,vdata_input.shape[0],1), dtype=np.float32)
                 
-            print(f"vl {cts_numpy([v_result[0]])} ", end="")
-            print(f"va {cts_numpy([v_result[1]])} ", end="")
+                for start in range(0,vdata_input.shape[0]):
+                    losses, accuracies, _ = do_step(vdata_input[start:start+1], target=vdata_target[start:start+1], training=False, n_iters=prm['EVALUATION_ITERS'])
+                    v_result[0,start] = losses[0].numpy()
+                    v_result[1,start] = accuracies[0].numpy()
+                    
+                v_result = list(np.mean(v_result, axis=-2))
                 
+                print(f"{remove_braces(str(v_result[0]))} ", end="")
+                print(f"{remove_braces(str(v_result[1]))} ", end="")
+                    
+                with open("validation_log.txt", "a", encoding='utf8') as myfile:
+                    myfile.write(f"steps {steps} length {testlength} ")
+                    myfile.write(f"l {remove_braces(str(v_result[0]))} ")
+                    myfile.write(f"a {remove_braces(str(v_result[1]))} ")
+
             with open("validation_log.txt", "a", encoding='utf8') as myfile:
-                myfile.write(f"steps {steps} ")
-                myfile.write(f"l {cts_numpy([v_result[0]])} ")
-                myfile.write(f"a {cts_numpy([v_result[1]])} ")
                 myfile.write(f"\n")
+
 
         if steps % prm['GEN_STEPS'] == 0:
             notes_on = []
@@ -391,9 +480,11 @@ while True:
             #this one loads a midi 
             #generated = midisave.load_midi("C:\\datasets\\midi\\validation_midis\\spora.mid", clip=True)
             #generated = midisave.load_midi("C:\\datasets\\midi\\omat\\dehuman.mid", clip=True)
-            #generated = midisave.load_midi("C:\\datasets\\midi\\validation_midis\\main.mid", clip=True)
-            generated = midisave.load_midi("Q:\\gamemidi\\Doom\\02 - At Doom's Gate (E1M1).mid", clip=True)
-            generated = generated[:256]
+            generated = midisave.load_midi("C:\\datasets\\midi\\validation_midis\\main.mid", clip=True)
+            #generated = midisave.load_midi("Q:\\gamemidi\\Doom\\02 - At Doom's Gate (E1M1).mid", clip=True)
+            #generated = midisave.load_midi("Q:\\gamemidi\\Descent\\Game01.mid", clip=True)
+            #generated = midisave.load_midi("Q:\\gamemidi\\Rise of the Triad\\ROTT_005.mid", clip=True)
+            generated = generated[:512]
             
             #TESTING START
             """n_output_old = tasksolver(tf.expand_dims(generated,axis=0)[0:1,-prm['N_TIMESTEPS']:])
@@ -411,15 +502,19 @@ while True:
             
             #generate the cache for the prompt
             if len(generated) > 1:
-                _, transformer_cache, tokenshift_cache = tasksolver.call_gen(tf.expand_dims(generated,axis=0)[0:1,:-1])
+                #_, transformer_cache, tokenshift_cache = tasksolver.call_gen(tf.expand_dims(generated,axis=0)[0:1,:-1])
+                pass
             else:
                 transformer_cache = None
                 tokenshift_cache = None
-            
+            print()
             #this one starts from scratch with no prompt
             #generated = [midisave.TOKEN_DELAY+16] #start the generated stuff with a short pause
             while len(generated) <= prm['GEN_LENGTH']:
-                n_output,transformer_cache,tokenshift_cache = tasksolver.call_gen(tf.expand_dims(generated,axis=0)[0:1,-1:], transformer_cache, tokenshift_cache)
+                #print(f"{len(generated)} ", flush=True, end="")
+                #n_output,transformer_cache,tokenshift_cache = tasksolver.call_gen(tf.expand_dims(generated,axis=0)[0:1,-1:], transformer_cache, tokenshift_cache)
+                t1 = tf.expand_dims(generated,axis=0)[0:1,-1024:]
+                n_output = tasksolver(t1)
                 
                 #top-k sampling
                 #result = tf.math.top_k(n_output[0,-1], k=prm['TOP_K'], sorted=False)
@@ -467,13 +562,13 @@ while True:
                         #print(f"{len(generated)} BAD NOTE c{c} n{bad_note[0]} t{bad_note[1]}")
                         if current_channel != c:
                             generated.append(midisave.TOKEN_CHANNEL_PROGRAM+c+current_instrument[c]*16)
-                            n_output,transformer_cache,tokenshift_cache = tasksolver.call_gen(tf.expand_dims(generated,axis=0)[0:1,-1:], transformer_cache, tokenshift_cache)
+                            #n_output,transformer_cache,tokenshift_cache = tasksolver.call_gen(tf.expand_dims(generated,axis=0)[0:1,-1:], transformer_cache, tokenshift_cache)
                             current_channel = c
                             
                         generated.append(midisave.TOKEN_NOTE_OFF+bad_note[0])
-                        n_output,transformer_cache,tokenshift_cache = tasksolver.call_gen(tf.expand_dims(generated,axis=0)[0:1,-1:], transformer_cache, tokenshift_cache)
+                        #n_output,transformer_cache,tokenshift_cache = tasksolver.call_gen(tf.expand_dims(generated,axis=0)[0:1,-1:], transformer_cache, tokenshift_cache)
             
-            midisave.save_midi(generated, f"outs/{training_sess_id}_{steps}s.mid")
+            midisave.save_midi(generated, f"outs/{training_sess_id}_{steps}_topp{prm['TOP_P']}_{str(random.randrange(1000000000))}.mid")
 
 
         if steps % prm['SAVE_STEPS'] == 0:

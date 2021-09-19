@@ -11,13 +11,13 @@ import glob
 
 import midisave
 
-midis = glob.glob(f"Q:\\midi\\*\\*.mid")
-savefilename = f"C:\\datasets\\midi\\training_tokens_{midisave.version}.npy"
-clip = False
+#midis = glob.glob(f"Q:\\midi\\*\\*.mid")
+#savefilename = f"C:\\datasets\\midi\\training_tokens_{midisave.version}.npy"
+#clip = False
 
-#midis = glob.glob("C:\\datasets\\midi\\validation_midis\\*.mid")
-#savefilename = f"C:\\datasets\\midi\\validation_tokens_{midisave.version}.npy"
-#clip = True
+midis = glob.glob("C:\\datasets\\midi\\validation_midis\\*.mid")
+savefilename = f"C:\\datasets\\midi\\validation_tokens_{midisave.version}.npy"
+clip = True
 
 #midis = list(pathlib.Path('q:\\gamemidi').rglob('*.mid'))
 #savefilename = f"C:\\datasets\\midi\\gamemidi_tokens_{midisave.version}.npy"

@@ -70,7 +70,7 @@ def load_midi(filename, clip):
     try:
         mid = mido.MidiFile(filename, clip=clip)
     except Exception as err:
-        #print(f"OPEN {filename}: {type(err)} {err}")
+        print(f"OPEN {filename}: {type(err)} {err}")
         return None
         
     total_delay=0.0
@@ -136,7 +136,7 @@ def load_midi(filename, clip):
                 out.extend([TOKEN_CHANNEL_PROGRAM+m['channel']+m['program']*16])
 
     except Exception as err:
-        #print(f"MERGE {filename}: {type(err)} {err}")
+        print(f"MERGE {filename}: {type(err)} {err}")
         return None
 
     out.extend([TOKEN_DELAY+convert_delay(5000)])    
