@@ -1,6 +1,7 @@
 import mido
 from mido.midifiles.midifiles import DEFAULT_TEMPO
 from mido.midifiles.tracks import MidiTrack, merge_tracks, fix_end_of_track
+import numpy as np
 
 version = "v4"
 
@@ -55,16 +56,42 @@ controller_to_id = {}
 for c in range(N_CONTROLLERS):
     controller_to_id[id_to_controller[c]] = c
 
-TOKEN_CHANNEL_PROGRAM  = 0
-TOKEN_DELAY            = 16*128
-TOKEN_NOTE_ON          = 16*128+384
-TOKEN_NOTE_ON_DRUMS    = 16*128+384+128
-TOKEN_NOTE_OFF         = 16*128+384+128+128
-TOKEN_VELOCITY         = 16*128+384+128+128+128
-TOKEN_CONTROLLER_TYPE  = 16*128+384+128+128+128+128
-TOKEN_CONTROLLER_VALUE = 16*128+384+128+128+128+128+N_CONTROLLERS
-TOKEN_PITCHBEND        = 16*128+384+128+128+128+128+N_CONTROLLERS+128
-N_TOKEN_TOTAL          = 16*128+384+128+128+128+128+N_CONTROLLERS+128+128
+
+#139 comes from 128 notes, 10 controllers (incl. pitch bend) and 1 delay
+
+
+#NOTE:       note      , velocity, channel, program, length
+#CONTROLLER: controller, value   , channel, 0      , 0
+#DELAY:      delay     , 0       , 0      , 0      , length
+#
+#vocab_size: 128+10+1  , 128+128 , 16     , 128    , 384#
+#            140       , 256     , 16     , 128    , 384
+#total = 923
+
+
+"""TOKEN_NCD     = 0
+TOKEN_VELVAL  = 139
+TOKEN_CHANNEL = 139+256
+TOKEN_PROGRAM = 139+256+16
+TOKEN_LENGTH  = 139+256+16+128
+N_TOKEN_TOTAL = 139+256+16+128+384"""
+
+TOKEN_CHANNEL_PROGRAM  = 0                                                  #   0-2047
+TOKEN_DELAY            = 16*128                                             #2048-2431
+TOKEN_NOTE_ON          = 16*128+384                                         #2432-2559    
+TOKEN_NOTE_ON_DRUMS    = 16*128+384+128                                     #2560-2687
+TOKEN_NOTE_OFF         = 16*128+384+128+128                                 #2688-2815
+TOKEN_VELOCITY         = 16*128+384+128+128+128                             #2816-2943
+TOKEN_CONTROLLER_TYPE  = 16*128+384+128+128+128+128                         #2944-2952
+TOKEN_CONTROLLER_VALUE = 16*128+384+128+128+128+128+N_CONTROLLERS           #2953-3080
+TOKEN_PITCHBEND        = 16*128+384+128+128+128+128+N_CONTROLLERS+128       #3081-3209
+N_TOKEN_TOTAL          = 16*128+384+128+128+128+128+N_CONTROLLERS+128+128   #^ TOKEN ID RANGES
+
+
+token_to_ms = np.array([unconvert_delay(x)*DELAY_PRECISION for x in range(TOKEN_NOTE_ON-TOKEN_DELAY)], dtype=np.float32)
+token_to_ms = np.concatenate([np.zeros(TOKEN_DELAY, dtype=np.float32), token_to_ms, np.zeros(N_TOKEN_TOTAL-TOKEN_NOTE_ON, dtype=np.float32)], axis=-1)
+assert token_to_ms.shape[0] == N_TOKEN_TOTAL, "token_to_ms is the wrong shape in midisave.py"
+
 
 def load_midi(filename, clip):
     try:
