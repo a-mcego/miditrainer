@@ -27,7 +27,7 @@ import datahandler
 import midisave
 
 from counting import Counting
-from transformer import Transformer, DenseLayer, EmbeddingLayer, Normalizer
+from transformer import Transformer, DenseLayer, EmbeddingLayer, Normalizer, floattype
 import posenc
 
 def get_replacer(tokens):
@@ -151,19 +151,20 @@ prm['LEARNING_RATE_MIN'] = 0.001
 prm['ADAM_EPSILON'] = 1e-5
 prm['BATCH_SIZE'] = 16
 prm['WARMUP_STEPS'] = 0
-prm['N_TIMESTEPS'] = 512
+prm['N_TIMESTEPS'] = 64
 prm['VOCAB_SIZE'] = midisave.N_TOKEN_TOTAL
-prm['GEN_LENGTH'] = 2048
-prm['TOP_P'] = 0.95
+prm['GEN_LENGTH'] = 4096
+prm['TOP_P'] = 0.92
 prm['MODEL_SAVE_DIR'] = "Q:\\midi_model_saves\\" + sys.argv[1]
 prm['TOKEN_SHIFT'] = 4
 prm['AUX_LOSSES'] = False
 prm['EVALUATION_ITERS'] = 6
 prm['EMBEDDING_SLICER'] = 1
-prm['POSEMB_SIZE'] = prm['N_TIMESTEPS']
+#prm['POSEMB_SIZE'] = prm['N_TIMESTEPS']
 prm['GRADIENT_ACCUMULATION'] = None
+prm['VALIDATION_LENGTHS'] = [64, 128, 256, 512, 1024]
 
-#tf.keras.mixed_precision.set_global_policy
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
 for key in prm:
     print(f"{key}={prm[key]} ",end="")
@@ -173,6 +174,7 @@ if not os.path.exists(prm['MODEL_SAVE_DIR']):
     os.mkdir(prm['MODEL_SAVE_DIR'])
 
 steps = 1
+tokens_seen = prm['N_TIMESTEPS']*prm['BATCH_SIZE']
 
 def remove_braces(stuff):
     return stuff.replace('[','').replace(']','')
@@ -262,7 +264,7 @@ class TaskSolverRecursive(tf.keras.Model):
         #self.embedding = EmbeddingLayer(prm['VOCAB_SIZE'], prm['MODEL_SIZE']//2//self.embedding_slicer)
         self.embedding = MidiEmbedder()
         
-        self.posemb = EmbeddingLayer(prm['POSEMB_SIZE'], prm['MODEL_SIZE'])
+        #self.posemb = EmbeddingLayer(prm['POSEMB_SIZE'], prm['MODEL_SIZE'])
 
         self.xformer = Transformer(model_size=prm['MODEL_SIZE'], num_layers=prm['XF_LAYERS'], heads=prm['XF_HEADS'], use_causal_mask=True, use_counter=False, normalize_columns=False, aux_losses=True, token_shift_n=prm['TOKEN_SHIFT'])
         #self.xformer = Transformer(model_size=prm['MODEL_SIZE'], num_layers=1, heads=prm['XF_HEADS'], use_causal_mask=True, use_counter=False, normalize_columns=False, aux_losses=True, token_shift_n=prm['TOKEN_SHIFT'])
@@ -289,19 +291,15 @@ class TaskSolverRecursive(tf.keras.Model):
         n_output = tf.reshape(n_output, [n_output.shape[0], n_output.shape[1], prm['MODEL_SIZE']])
         
         #posemb here
-        pmb = tf.range(n_input.shape[-1], dtype=tf.int64) 
-        pmb = tf.broadcast_to(tf.expand_dims(pmb, axis=0), [n_input.shape[0],pmb.shape[-1]])
-        if is_training:
-            pmb += tf.random.uniform(shape=[n_input.shape[0],1], minval=0, maxval=prm['POSEMB_SIZE'], dtype=tf.int64)
+        #pmb = tf.range(n_input.shape[-1], dtype=tf.int64) 
+        #pmb = tf.broadcast_to(tf.expand_dims(pmb, axis=0), [n_input.shape[0],pmb.shape[-1]])
+        #if is_training:
+        #    pmb += tf.random.uniform(shape=[n_input.shape[0],1], minval=0, maxval=prm['POSEMB_SIZE'], dtype=tf.int64)
         
-        pmb %= prm['POSEMB_SIZE']
+        #pmb %= prm['POSEMB_SIZE']
         
-        #plt.imshow(pmb)
-        #plt.show()
-        #exit(0)
-        
-        pmb = self.posemb(pmb)
-        n_output += pmb
+        #pmb = self.posemb(pmb)
+        #n_output += pmb
         
         
         if self.embedding_slicer > 1:
@@ -386,6 +384,7 @@ def lr_scheduler():
     return max(minimum,calculated)
 
 optimizer = tf.keras.optimizers.Adam(learning_rate=lr_scheduler,amsgrad=True,epsilon=prm['ADAM_EPSILON'])
+optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
 
 start_time = time.time()
 
@@ -396,15 +395,17 @@ def do_step(n_input, target, training, time_data, n_iters=prm['XF_LAYERS']):
     if training:
         with tf.GradientTape() as tape:
             n_output = tasksolver(n_input, time_data, is_training=training)
-            loss_c = tf.keras.losses.sparse_categorical_crossentropy(target, n_output, from_logits=True)
+            loss_c = tf.keras.losses.sparse_categorical_crossentropy(target, tf.cast(n_output, tf.float32), from_logits=True)
             loss_c = tf.reduce_mean(loss_c, axis=[-1,-2])
             pred_ids = tf.keras.backend.argmax(n_output,axis=-1)
+            loss_scaled = optimizer.get_scaled_loss(loss_c)
             losses.append(loss_c)
-        gradients = tape.gradient(losses, tasksolver.trainable_variables, unconnected_gradients=tf.UnconnectedGradients.ZERO)
+        gradients = tape.gradient([loss_scaled], tasksolver.trainable_variables, unconnected_gradients=tf.UnconnectedGradients.ZERO)
+        gradients = optimizer.get_unscaled_gradients(gradients)
         optimizer.apply_gradients(zip(gradients, tasksolver.trainable_variables))
     else:
         n_output = tasksolver(n_input, time_data, is_training=training, n_iters=n_iters)
-        loss_c = tf.keras.losses.sparse_categorical_crossentropy(target, n_output, from_logits=True)
+        loss_c = tf.keras.losses.sparse_categorical_crossentropy(target, tf.cast(n_output, tf.float32), from_logits=True)
         loss_c = tf.reduce_mean(loss_c, axis=[-1,-2])
         pred_ids = tf.keras.backend.argmax(n_output,axis=-1)
         losses.append(loss_c)
@@ -436,6 +437,10 @@ if os.path.isfile(prm['MODEL_SAVE_DIR']+'/settings.txt'):
     
     steps = settings['steps']
     training_sess_id = settings['training_sess_id']
+    if 'tokens_seen' in settings:
+        tokens_seen = settings['tokens_seen']
+    else:
+        tokens_seen = steps*prm['N_TIMESTEPS']*prm['BATCH_SIZE']
 
 with open("training_log.txt", "a", encoding='utf8') as myfile:
     write_header(myfile)
@@ -460,6 +465,7 @@ def get_time_embedding(n_input, randomize=True):
     times1 = tf.math.cos(timfreq)
     times2 = tf.math.sin(timfreq)
     times = tf.concat([times1,times2], axis=-1)*0.06
+    times = tf.cast(times, floattype)
     return times
     
 
@@ -502,7 +508,16 @@ while True:
         #pmb = tasksolver.posemb(pmb[None])[0]
 
         #pmb = tf.range(0,midisave.N_TOKEN_TOTAL-16*128, dtype=tf.int64)
+        #pmb = tf.range(0,384, dtype=tf.int64)
+        #pmb = tf.convert_to_tensor([midisave.convert_delay(x) for x in range(3072)], dtype=tf.int64)
+        
         #pmb = tasksolver.embedding.rest_emb(pmb[None])[0]
+
+        #pmb = tf.range(0,16, dtype=tf.int64)
+        #pmb = tasksolver.embedding.chans_emb(pmb[None])[0]
+
+        #pmb = tf.range(0,128, dtype=tf.int64)
+        #pmb = tasksolver.embedding.insts_emb(pmb[None])[0]
 
         #pmb = tf.math.l2_normalize(pmb)
         #pmb = tf.einsum('ab,cb->ac',pmb,pmb)
@@ -534,7 +549,7 @@ while True:
             myfile.write(" | ")"""
             
             myfile.write(format_to(tasksolver.time_data_multiplier.numpy()))
-            myfile.write(format_to(tasksolver.posemb.norm.mult.numpy()))
+            #myfile.write(format_to(tasksolver.posemb.norm.mult.numpy()))
             myfile.write("\n")
 
 
@@ -553,13 +568,13 @@ while True:
         accs_char = np.array([(tf.add_n(all_accs_char) / len(all_accs_char))])
 
         with open("training_log.txt", "a", encoding='utf8') as myfile:
-            myfile.write(f"{steps} {steps*prm['N_TIMESTEPS']*prm['BATCH_SIZE']} {round(totaltime,4)} s ")
+            myfile.write(f"{steps} {tokens_seen} {round(totaltime,4)} s ")
             myfile.write(f"{round(token_per_second*86400.0/1000.0/1000.0/1000.0,4)} Gtok/day ")
             myfile.write(f"l {cts2(losses)} ")
             myfile.write(f"a {cts2(accs_char)} ")
             myfile.write(f"\n")
 
-        print(f"{steps} {steps*prm['N_TIMESTEPS']*prm['BATCH_SIZE']} {round(totaltime,4)} s ", end='')
+        print(f"{steps} {tokens_seen} {round(totaltime,4)} s ", end='')
         print(f"{round(token_per_second*86400.0/1000.0/1000.0/1000.0,4)} Gtok/day ", end='')
         print(f"l {remove_braces(str(losses))} ", end='')
         print(f"a {remove_braces(str(accs_char))} ", end='')
@@ -571,7 +586,8 @@ while True:
             
             print(f"vl/a ", end="")
             
-            testlengths = [prm['N_TIMESTEPS'], prm['N_TIMESTEPS']*2, prm['N_TIMESTEPS']*4]
+            #testlengths = [prm['N_TIMESTEPS'], prm['N_TIMESTEPS']*2, prm['N_TIMESTEPS']*4]
+            testlengths = prm['VALIDATION_LENGTHS']
             for testlength in testlengths:
             
                 vdata_input = vdata[:-1]
@@ -621,12 +637,12 @@ while True:
             #generated = midisave.load_midi("C:\\datasets\\midi\\omat\\dehuman.mid", clip=True)
             #generated = midisave.load_midi("C:\\datasets\\midi\\omat\\piano001.mid", clip=True)
             #generated = midisave.load_midi("C:\\datasets\\midi\\validation_midis\\main.mid", clip=True)
-            #generated = midisave.load_midi("Q:\\gamemidi\\Doom\\02 - At Doom's Gate (E1M1).mid", clip=True)
+            generated = midisave.load_midi("Q:\\gamemidi\\Doom\\02 - At Doom's Gate (E1M1).mid", clip=True)
             #generated = midisave.load_midi("Q:\\gamemidi\\Descent\\Game01.mid", clip=True)
             #generated = midisave.load_midi("Q:\\gamemidi\\Rise of the Triad\\ROTT_005.mid", clip=True)
             #generated = midisave.load_midi("C:\\Users\\liimaeve\\wind.mid", clip=True)
-            #generated = generated[:384]
-            generated = [midisave.TOKEN_DELAY+16] #start the generated stuff with a short pause
+            generated = generated[:384]
+            #generated = [midisave.TOKEN_DELAY+16] #start the generated stuff with a short pause
             
             #TESTING START
             """n_output_old = tasksolver(tf.expand_dims(generated,axis=0)[0:1,-prm['N_TIMESTEPS']:])
@@ -731,6 +747,7 @@ while True:
             
             sets = {
                 'steps':steps+1, 
+                'tokens_seen':tokens_seen+prm['N_TIMESTEPS']*prm['BATCH_SIZE'],
                 'folder':ckptfolder, 
                 'training_sess_id': training_sess_id
             }
@@ -745,3 +762,4 @@ while True:
         all_accs_char = []
         
     steps += 1
+    tokens_seen += prm['N_TIMESTEPS']*prm['BATCH_SIZE']

@@ -4,7 +4,7 @@ import functools
 
 import counting
 
-floattype = tf.float32
+floattype = tf.float16
 
 def reduce(matrix, axis):
     mean = tf.math.reduce_mean(matrix, axis=axis, keepdims=True)
@@ -207,10 +207,12 @@ class Transformer(tf.keras.Model):
             self.counting = [counting.Abstraction(model_size,self.abstraction_size, self.use_causal_mask) for _ in range(num_layers)]
             self.counting_norm = [normalizer() for _ in range(num_layers)]
             
-        MAX_LENGTH = 2048+64
+        MAX_LENGTH = 3072+64
         bp = tf.linalg.band_part(tf.ones((1,MAX_LENGTH,MAX_LENGTH)), -1, 0)
-        self.causal_mask = tf.where(bp==0,-90000000.0,0.0)
+        self.causal_mask = tf.where(bp==0,-50000000.0,0.0)
         #self.causal_mask = tf.where(bp==0,0.0,1.0)
+        
+        self.causal_mask = tf.cast(self.causal_mask, floattype)
         
     def call(self, target_sequence, source_sequence=None):
         if self.use_causal_mask:
